@@ -224,112 +224,14 @@ def build_enet(inp_dims):
 #end ported third party code
 
 ###############################
-###     Training Script     ###
-###############################
-
-def get_data(f_path):
-    train_X = np.load(os.path.join(f_path,'train/train_X.npy'))
-    train_Y = np.load(os.path.join(f_path,'train/train_Y.npy'))
-    validation_X = np.load(os.path.join(f_path,'validation/validation_X.npy'))
-    validation_Y = np.load(os.path.join(f_path,'validation/validation_Y.npy'))
-    return train_X, train_Y, validation_X, validation_Y
-
-def train(channel_input_dirs, hyperparameters, hosts, **kwargs):
-    # retrieve the hyperparameters we set in notebook (with some defaults)
-    model = hyperparameters.get('model', 'enet')
-    batch_size = hyperparameters.get('batch_size', 128)
-    epochs = hyperparameters.get('epochs', 100)
-    learning_rate = hyperparameters.get('learning_rate', 0.1)
-    beta1 = hyperparameters.get('beta1', 0.9)
-    beta2 = hyperparameters.get('beta2', 0.99)
-    mean = hyperparameters.get('mean', [0, 0, 0])
-    std = hyperparameters.get('std', [1, 1, 1])
-    num_gpus = hyperparameters.get('num_gpus', 0)
-    burn_in = hyperparameters.get('burn_in', 5)
-    # set logging
-    logging.getLogger().setLevel(logging.DEBUG)
-
-    if len(hosts) == 1:
-        kvstore = 'device' if num_gpus > 0 else 'local'
-    else:
-        kvstore = 'dist_device_sync' if num_gpus > 0 else 'dist_sync'
-
-    ctx = [mx.gpu(i) for i in range(num_gpus)] if num_gpus > 0 else [mx.cpu()]
-    print (ctx)
-    f_path = channel_input_dirs['training']
-    train_X, train_Y, validation_X, validation_Y = get_data(f_path)
-    
-    print ('loaded data')
-    
-    train_iter = train_iter = mx.io.NDArrayIter(data = train_X, label=train_Y, batch_size=batch_size, shuffle=True)
-    validation_iter = mx.io.NDArrayIter(data = validation_X, label=validation_Y, batch_size=batch_size, shuffle=False)
-    data_shape = (batch_size,) + train_X.shape[1:]
-
-    print ('created iters')
-    
-    print ('building %s' % model)
-    if model == 'enet':
-        sym = build_enet(inp_dims=data_shape[1:])
-    else:
-        sym = build_unet()
-    net = mx.mod.Module(sym, context=ctx, data_names=('data',), label_names=('label',))
-    net.bind(data_shapes=[['data', data_shape]], label_shapes=[['label', data_shape]])
-    net.init_params(mx.initializer.Xavier(magnitude=6))
-    net.init_optimizer(optimizer = 'adam', 
-                               optimizer_params=(
-                                   ('learning_rate', learning_rate),
-                                   ('beta1', beta1),
-                                   ('beta2', beta2)
-                              ))
-    print ('start training')
-    smoothing_constant = .01
-    curr_losses = []
-    moving_losses = []
-    i = 0
-    best_val_loss = np.inf
-    for e in range(epochs):
-        while True:
-            try:
-                batch = next(train_iter)
-            except StopIteration:
-                train_iter.reset()
-                break
-            net.forward_backward(batch)
-            loss = net.get_outputs()[0]
-            net.update()
-            curr_loss = F.mean(loss).asscalar()
-            curr_losses.append(curr_loss)
-            moving_loss = (curr_loss if ((i == 0) and (e == 0))
-                                   else (1 - smoothing_constant) * moving_loss + (smoothing_constant) * curr_loss)
-            moving_losses.append(moving_loss)
-            i += 1
-        val_losses = []
-        for batch in validation_iter:
-            net.forward(batch)
-            loss = net.get_outputs()[0]
-            val_losses.append(F.mean(loss).asscalar())
-        validation_iter.reset()
-        # early stopping
-        val_loss = np.mean(val_losses)
-        if e > burn_in and val_loss < best_val_loss:
-            best_val_loss = val_loss
-            net.save_checkpoint('best_net', 0)
-            print("Best model at Epoch %i" %(e+1))
-        print("Epoch %i: Moving Training Loss %0.5f, Validation Loss %0.5f" % (e+1, moving_loss, val_loss))
-    net.load_params('best_net-0000.params')
-    return net
-
-###############################
 ###     Hosting Methods     ###
 ###############################
 
 def model_fn(model_dir):
-    sym, arg_params, aux_params = mx.model.load_checkpoint('%s/model' % model_dir, 0)
-    with open('%s/model-shapes.json' % model_dir) as f:
-        shapes = json.load(f)
-    shape = shapes[0]['shape']
+    _, arg_params, aux_params = mx.model.load_checkpoint('%s/model' % model_dir, 0)
     batch_size = 1
-    data_shape = (batch_size, 1, shape[2], shape[3])
+    data_shape = (batch_size, 1, 720, 720)
+    sym = build_enet(data_shape[1:])
     net = mx.mod.Module(sym, data_names=('data',), label_names=('label',))
     net.bind(data_shapes=[['data', data_shape]], label_shapes=[['label', data_shape]], for_training=False)
     net.set_params(arg_params, aux_params)

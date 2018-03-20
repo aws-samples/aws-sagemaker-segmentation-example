@@ -279,17 +279,17 @@ def build_enet(inp_dims):
     out = mx.sym.Group([loss, mask_output])
     return out
 #end modified third party code
-
-###############################
-###     Training Script     ###
-###############################
-
+                              
 def get_data(f_path):
     train_X = np.load(os.path.join(f_path,'train/train_X.npy'))
     train_Y = np.load(os.path.join(f_path,'train/train_Y.npy'))
     validation_X = np.load(os.path.join(f_path,'validation/validation_X.npy'))
     validation_Y = np.load(os.path.join(f_path,'validation/validation_Y.npy'))
     return train_X, train_Y, validation_X, validation_Y
+
+###############################
+###     Training Script     ###
+###############################
 
 def train(channel_input_dirs, hyperparameters, hosts, **kwargs):
     # retrieve the hyperparameters we set in notebook (with some defaults)
@@ -306,18 +306,21 @@ def train(channel_input_dirs, hyperparameters, hosts, **kwargs):
     # set logging
     logging.getLogger().setLevel(logging.DEBUG)
 
+    # setup for distributed training
     if len(hosts) == 1:
         kvstore = 'device' if num_gpus > 0 else 'local'
     else:
         kvstore = 'dist_device_sync' if num_gpus > 0 else 'dist_sync'
-
+                              
+    # set context for gpu if available, else cpu
     ctx = [mx.gpu(i) for i in range(num_gpus)] if num_gpus > 0 else [mx.cpu()]
     print (ctx)
     f_path = channel_input_dirs['training']
+    # load data
     train_X, train_Y, validation_X, validation_Y = get_data(f_path)
     
     print ('loaded data')
-    
+    # define MXNet iterators
     train_iter = train_iter = mx.io.NDArrayIter(data = train_X, label=train_Y, batch_size=batch_size, shuffle=True)
     validation_iter = mx.io.NDArrayIter(data = validation_X, label=validation_Y, batch_size=batch_size, shuffle=False)
     data_shape = (batch_size,) + train_X.shape[1:]
@@ -325,10 +328,12 @@ def train(channel_input_dirs, hyperparameters, hosts, **kwargs):
     print ('created iters')
     
     print ('building %s' % model)
+    # build relevant model
     if model == 'enet':
         sym = build_enet(inp_dims=data_shape[1:])
     else:
         sym = build_unet()
+    # build network, bind to data shapes, and initialize parameters and optimizer
     net = mx.mod.Module(sym, context=ctx, data_names=('data',), label_names=('label',))
     net.bind(data_shapes=[['data', data_shape]], label_shapes=[['label', data_shape]])
     net.init_params(mx.initializer.Xavier(magnitude=6))
@@ -338,6 +343,7 @@ def train(channel_input_dirs, hyperparameters, hosts, **kwargs):
                                    ('beta1', beta1),
                                    ('beta2', beta2)
                               ))
+    # begin training loop, tracking loss values
     print ('start training')
     smoothing_constant = .01
     curr_losses = []
@@ -346,20 +352,25 @@ def train(channel_input_dirs, hyperparameters, hosts, **kwargs):
     best_val_loss = np.inf
     for e in range(epochs):
         while True:
+            # if iterator is out, reset and move to next epoch
             try:
                 batch = next(train_iter)
             except StopIteration:
                 train_iter.reset()
                 break
+            # forward and backward pass
             net.forward_backward(batch)
             loss = net.get_outputs()[0]
+            # optimizer step
             net.update()
+            # loss calculations
             curr_loss = F.mean(loss).asscalar()
             curr_losses.append(curr_loss)
             moving_loss = (curr_loss if ((i == 0) and (e == 0))
                                    else (1 - smoothing_constant) * moving_loss + (smoothing_constant) * curr_loss)
             moving_losses.append(moving_loss)
             i += 1
+        # loss metrics
         val_losses = []
         for batch in validation_iter:
             net.forward(batch)
@@ -368,11 +379,13 @@ def train(channel_input_dirs, hyperparameters, hosts, **kwargs):
         validation_iter.reset()
         # early stopping
         val_loss = np.mean(val_losses)
+        # early stopping by saving the model w/ best validation metric
         if e > burn_in and val_loss < best_val_loss:
             best_val_loss = val_loss
             net.save_checkpoint('best_net', 0)
             print("Best model at Epoch %i" %(e+1))
         print("Epoch %i: Moving Training Loss %0.5f, Validation Loss %0.5f" % (e+1, moving_loss, val_loss))
+    # load the model with the best validation metrics, then
     net.load_params('best_net-0000.params')
     return net
 
